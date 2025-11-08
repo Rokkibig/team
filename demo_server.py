@@ -5,26 +5,80 @@ Simple FastAPI server to demonstrate core functionality
 
 import os
 import json
+import asyncpg
+import redis.asyncio as aioredis
 from datetime import datetime
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import Dict, Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Load environment
 load_dotenv()
+
+# Validate critical env variables
+REQUIRED_ENV = ["DATABASE_URL", "REDIS_URL", "JWT_SECRET"]
+missing = [e for e in REQUIRED_ENV if not os.getenv(e)]
+if missing:
+    raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
 # Import our security modules
 from api.security import rbac, Permission, AuditLogger
 from supervisor_optimizer.llm_utils import safe_parse_synthesis, sanitize_llm_response
 from common.circuit_breaker import CircuitBreaker, circuit_breaker_registry
 
-# Create app
+# ============================================================================
+# LIFESPAN - DB Pool & Redis Connection
+# ============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown"""
+    # Startup
+    print("🚀 Starting Golden Architecture V5.1...")
+
+    # Create database pool
+    app.state.db_pool = await asyncpg.create_pool(
+        os.getenv("DATABASE_URL"),
+        min_size=2,
+        max_size=10,
+        command_timeout=60
+    )
+    print("✅ Database pool created")
+
+    # Create Redis connection
+    app.state.redis = await aioredis.from_url(
+        os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        encoding="utf-8",
+        decode_responses=True
+    )
+    print("✅ Redis connected")
+
+    # Initialize rate limiter
+    limiter = Limiter(key_func=get_remote_address)
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    print("✅ Rate limiter initialized")
+
+    yield
+
+    # Shutdown
+    print("🛑 Shutting down...")
+    await app.state.db_pool.close()
+    await app.state.redis.close()
+    print("✅ Cleanup complete")
+
+# Create app with lifespan
 app = FastAPI(
     title="Golden Architecture V5.1",
     description="Battle-Hardened Multi-Agent System",
-    version="5.1.0"
+    version="5.1.0",
+    lifespan=lifespan
 )
 
 # ============================================================================
@@ -114,12 +168,9 @@ async def governance_status():
     - Database integration
     - Governance controls
     """
-    import asyncpg
-
     try:
-        conn = await asyncpg.connect(os.getenv("DATABASE_URL"))
-        rows = await conn.fetch("SELECT * FROM governance_status")
-        await conn.close()
+        async with app.state.db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM governance_status")
 
         return {
             "governance": [dict(row) for row in rows]
@@ -179,20 +230,15 @@ async def get_stats():
     - System observability
     - Metrics collection
     """
-    import asyncpg
-
     try:
-        conn = await asyncpg.connect(os.getenv("DATABASE_URL"))
-
-        tasks_count = await conn.fetchval("SELECT COUNT(*) FROM tasks")
-        escalations_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM escalations WHERE resolved = FALSE"
-        )
-        dlq_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM dlq_messages WHERE resolved = FALSE"
-        )
-
-        await conn.close()
+        async with app.state.db_pool.acquire() as conn:
+            tasks_count = await conn.fetchval("SELECT COUNT(*) FROM tasks")
+            escalations_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM escalations WHERE resolved = FALSE"
+            )
+            dlq_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM dlq_messages WHERE resolved = FALSE"
+            )
 
         return {
             "tasks": {
@@ -239,17 +285,12 @@ async def get_config(user=Depends(rbac.verify_token)):
     }
 
 # ============================================================================
-# STARTUP
+# INCLUDE NEW API ENDPOINTS
 # ============================================================================
 
-@app.on_event("startup")
-async def startup():
-    """Startup tasks"""
-    print("🚀 Golden Architecture V5.1 starting...")
-    print(f"   Database: {os.getenv('DATABASE_URL')}")
-    print(f"   Redis: {os.getenv('REDIS_URL')}")
-    print(f"   NATS: {os.getenv('NATS_URL')}")
-    print("✅ Server ready!")
+# Include new endpoints router
+from api.new_endpoints import router as new_endpoints_router
+app.include_router(new_endpoints_router, tags=["New APIs"])
 
 if __name__ == "__main__":
     import uvicorn

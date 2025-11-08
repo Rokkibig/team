@@ -60,6 +60,10 @@ class Permission:
     LEARNING_APPROVE = "learning.approve"
     LEARNING_VIEW = "learning.view"
 
+    # DLQ management
+    READ_DLQ = "dlq.read"
+    RESOLVE_DLQ = "dlq.resolve"
+
     # System administration
     SYSTEM_ADMIN = "system.admin"
     METRICS_VIEW = "metrics.view"
@@ -81,6 +85,8 @@ ROLE_PERMISSIONS = {
         Permission.BUDGET_CONFIGURE,
         Permission.LEARNING_APPROVE,
         Permission.LEARNING_VIEW,
+        Permission.READ_DLQ,
+        Permission.RESOLVE_DLQ,
         Permission.METRICS_VIEW,
     ],
     "operator": [
@@ -91,6 +97,7 @@ ROLE_PERMISSIONS = {
         Permission.TASK_VIEW,
         Permission.AGENT_VIEW,
         Permission.BUDGET_VIEW,
+        Permission.READ_DLQ,
         Permission.LEARNING_VIEW,
         Permission.METRICS_VIEW,
     ],
