@@ -1,0 +1,262 @@
+"""
+Golden Architecture V5.1 - Demo Server
+Simple FastAPI server to demonstrate core functionality
+"""
+
+import os
+import json
+from datetime import datetime
+from dotenv import load_dotenv
+
+from fastapi import FastAPI, HTTPException, Depends, Request
+from pydantic import BaseModel
+from typing import Dict, Optional
+
+# Load environment
+load_dotenv()
+
+# Import our security modules
+from api.security import rbac, Permission, AuditLogger
+from supervisor_optimizer.llm_utils import safe_parse_synthesis, sanitize_llm_response
+from common.circuit_breaker import CircuitBreaker, circuit_breaker_registry
+
+# Create app
+app = FastAPI(
+    title="Golden Architecture V5.1",
+    description="Battle-Hardened Multi-Agent System",
+    version="5.1.0"
+)
+
+# ============================================================================
+# MODELS
+# ============================================================================
+
+class SynthesisRequest(BaseModel):
+    """Request for LLM synthesis validation"""
+    llm_response: str
+
+class BudgetRequest(BaseModel):
+    """Request for budget allocation"""
+    purpose: str
+    estimated_tokens: int
+    model: str
+    task_id: str
+    project_id: str
+    tenant_id: str
+    request_id: Optional[str] = None
+
+# ============================================================================
+# ENDPOINTS
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "name": "Golden Architecture V5.1",
+        "status": "running",
+        "version": "5.1.0",
+        "features": {
+            "security": "multi-layer (LLM, RBAC, Sandbox)",
+            "reliability": "circuit breakers + DLQ",
+            "scalability": "SLO-based auto-scaling",
+            "governance": "learning rate limits"
+        }
+    }
+
+@app.get("/health")
+async def health():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "components": {
+            "api": "healthy",
+            "database": "healthy",  # Would check actual connection
+            "redis": "healthy",
+            "nats": "healthy"
+        }
+    }
+
+@app.post("/validate/synthesis")
+async def validate_synthesis(request: SynthesisRequest):
+    """
+    Validate LLM synthesis response
+
+    Demonstrates:
+    - JSON schema validation
+    - Input sanitization
+    - Security layer
+    """
+    try:
+        # Sanitize first
+        clean = sanitize_llm_response(request.llm_response)
+
+        # Validate and parse
+        result = safe_parse_synthesis(clean)
+
+        return {
+            "status": "valid",
+            "action_plan": result.action_plan,
+            "reasoning": result.reasoning,
+            "sanitized": clean != request.llm_response
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/governance/status")
+async def governance_status():
+    """
+    Get learning governance status
+
+    Demonstrates:
+    - Database integration
+    - Governance controls
+    """
+    import asyncpg
+
+    try:
+        conn = await asyncpg.connect(os.getenv("DATABASE_URL"))
+        rows = await conn.fetch("SELECT * FROM governance_status")
+        await conn.close()
+
+        return {
+            "governance": [dict(row) for row in rows]
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/circuit-breakers")
+async def get_circuit_breakers():
+    """
+    Get all circuit breaker states
+
+    Demonstrates:
+    - Circuit breaker pattern
+    - Fault tolerance
+    """
+    stats = circuit_breaker_registry.get_all_stats()
+
+    return {
+        "breakers": {
+            name: {
+                "state": stat.state,
+                "failure_count": stat.failure_count,
+                "total_calls": stat.total_calls,
+                "total_failures": stat.total_failures
+            }
+            for name, stat in stats.items()
+        }
+    }
+
+@app.post("/test/injection")
+async def test_injection(data: Dict):
+    """
+    Test SQL injection prevention
+
+    Demonstrates:
+    - Input sanitization
+    - Security validation
+    """
+    raw_input = data.get("input", "")
+    sanitized = sanitize_llm_response(raw_input)
+
+    return {
+        "original": raw_input,
+        "sanitized": sanitized,
+        "was_malicious": raw_input != sanitized,
+        "message": "✅ Injection blocked!" if raw_input != sanitized else "✅ Input clean"
+    }
+
+@app.get("/stats")
+async def get_stats():
+    """
+    Get system statistics
+
+    Demonstrates:
+    - System observability
+    - Metrics collection
+    """
+    import asyncpg
+
+    try:
+        conn = await asyncpg.connect(os.getenv("DATABASE_URL"))
+
+        tasks_count = await conn.fetchval("SELECT COUNT(*) FROM tasks")
+        escalations_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM escalations WHERE resolved = FALSE"
+        )
+        dlq_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM dlq_messages WHERE resolved = FALSE"
+        )
+
+        await conn.close()
+
+        return {
+            "tasks": {
+                "total": tasks_count
+            },
+            "escalations": {
+                "unresolved": escalations_count
+            },
+            "dlq": {
+                "unresolved": dlq_count
+            },
+            "system": {
+                "status": "operational",
+                "version": "5.1.0"
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# PROTECTED ENDPOINTS (with RBAC)
+# ============================================================================
+
+@app.get("/admin/config")
+@rbac.require_permission(Permission.SYSTEM_ADMIN)
+async def get_config(user=Depends(rbac.verify_token)):
+    """
+    Admin-only endpoint
+
+    Demonstrates:
+    - RBAC protection
+    - Permission enforcement
+    """
+    return {
+        "message": "Admin access granted",
+        "user": user,
+        "config": {
+            "jwt_secret_set": bool(os.getenv("JWT_SECRET")),
+            "database_url_set": bool(os.getenv("DATABASE_URL")),
+            "redis_url_set": bool(os.getenv("REDIS_URL")),
+            "nats_url_set": bool(os.getenv("NATS_URL"))
+        }
+    }
+
+# ============================================================================
+# STARTUP
+# ============================================================================
+
+@app.on_event("startup")
+async def startup():
+    """Startup tasks"""
+    print("🚀 Golden Architecture V5.1 starting...")
+    print(f"   Database: {os.getenv('DATABASE_URL')}")
+    print(f"   Redis: {os.getenv('REDIS_URL')}")
+    print(f"   NATS: {os.getenv('NATS_URL')}")
+    print("✅ Server ready!")
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", 8000)),
+        log_level="info"
+    )

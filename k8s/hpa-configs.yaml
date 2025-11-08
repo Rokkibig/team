@@ -1,0 +1,404 @@
+# ============================================================================
+# SLO-Based Auto-scaling Configuration
+# Horizontal Pod Autoscalers based on custom metrics and SLOs
+# ============================================================================
+
+---
+# Peer Hub HPA - Scale based on peer review consensus time
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: peer-hub-hpa
+  namespace: golden-architecture
+  labels:
+    app: peer-hub
+    component: scaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: peer-hub
+
+  minReplicas: 2
+  maxReplicas: 10
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 100  # Double pods
+        periodSeconds: 60
+      - type: Pods
+        value: 2
+        periodSeconds: 60
+      selectPolicy: Max  # Use most aggressive
+
+    scaleDown:
+      stabilizationWindowSeconds: 300  # 5 min before scale down
+      policies:
+      - type: Percent
+        value: 50  # Remove half
+        periodSeconds: 60
+      selectPolicy: Min  # Use most conservative
+
+  metrics:
+  # Scale based on p95 consensus time
+  - type: Pods
+    pods:
+      metric:
+        name: peer_review_consensus_time_p95
+      target:
+        type: AverageValue
+        averageValue: "150"  # Scale if p95 > 150s
+
+  # Also consider CPU
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+---
+# Supervisor HPA - Scale based on escalation queue depth
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: supervisor-hpa
+  namespace: golden-architecture
+  labels:
+    app: supervisor
+    component: scaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: supervisor
+
+  minReplicas: 1
+  maxReplicas: 5
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30  # Fast scale up
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 30
+
+    scaleDown:
+      stabilizationWindowSeconds: 600  # 10 min stabilization
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 120
+
+  metrics:
+  # Scale based on unresolved escalations
+  - type: Pods
+    pods:
+      metric:
+        name: supervisor_unresolved_escalations
+      target:
+        type: AverageValue
+        averageValue: "5"  # Scale if avg > 5 per pod
+
+  # Memory usage
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 75
+
+---
+# Orchestrator HPA - Scale based on active tasks
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: orchestrator-hpa
+  namespace: golden-architecture
+  labels:
+    app: orchestrator
+    component: scaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: orchestrator
+
+  minReplicas: 2
+  maxReplicas: 20
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 45
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 60
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+      selectPolicy: Max
+
+    scaleDown:
+      stabilizationWindowSeconds: 180
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 120
+
+  metrics:
+  # Scale based on active tasks
+  - type: Pods
+    pods:
+      metric:
+        name: orchestrator_active_tasks
+      target:
+        type: AverageValue
+        averageValue: "10"  # Scale if avg > 10 tasks per pod
+
+  # Queue depth
+  - type: Pods
+    pods:
+      metric:
+        name: orchestrator_task_queue_depth
+      target:
+        type: AverageValue
+        averageValue: "20"  # Scale if queue > 20 per pod
+
+  # CPU
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 65
+
+---
+# Sandbox Executor HPA - Scale based on execution queue
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sandbox-executor-hpa
+  namespace: golden-architecture
+  labels:
+    app: sandbox-executor
+    component: scaling
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sandbox-executor
+
+  minReplicas: 3
+  maxReplicas: 15
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30  # Fast scale for bursty workload
+      policies:
+      - type: Percent
+        value: 200  # Triple pods
+        periodSeconds: 30
+
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+      - type: Pods
+        value: 1
+        periodSeconds: 60
+
+  metrics:
+  # Scale based on queue depth
+  - type: Pods
+    pods:
+      metric:
+        name: sandbox_execution_queue_depth
+      target:
+        type: AverageValue
+        averageValue: "5"
+
+  # Execution time p95
+  - type: Pods
+    pods:
+      metric:
+        name: sandbox_execution_time_p95
+      target:
+        type: AverageValue
+        averageValue: "10"  # Scale if p95 > 10s
+
+  # CPU (code execution is CPU intensive)
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# ============================================================================
+# ServiceMonitor for Prometheus Custom Metrics
+# ============================================================================
+
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: peer-hub-metrics
+  namespace: golden-architecture
+  labels:
+    app: peer-hub
+spec:
+  selector:
+    matchLabels:
+      app: peer-hub
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: supervisor-metrics
+  namespace: golden-architecture
+  labels:
+    app: supervisor
+spec:
+  selector:
+    matchLabels:
+      app: supervisor
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: orchestrator-metrics
+  namespace: golden-architecture
+  labels:
+    app: orchestrator
+spec:
+  selector:
+    matchLabels:
+      app: orchestrator
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+apiVersion: v1
+kind: ServiceMonitor
+metadata:
+  name: sandbox-executor-metrics
+  namespace: golden-architecture
+  labels:
+    app: sandbox-executor
+spec:
+  selector:
+    matchLabels:
+      app: sandbox-executor
+  endpoints:
+  - port: metrics
+    interval: 15s  # More frequent for bursty workload
+    path: /metrics
+
+---
+# ============================================================================
+# PrometheusRule - SLO Alerts
+# ============================================================================
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: slo-alerts
+  namespace: golden-architecture
+  labels:
+    role: alert-rules
+spec:
+  groups:
+  - name: slo-violations
+    interval: 30s
+    rules:
+
+    # Peer review consensus time SLO
+    - alert: PeerReviewSLOViolation
+      expr: |
+        histogram_quantile(0.95,
+          rate(peer_review_consensus_time_bucket[5m])
+        ) > 180
+      for: 5m
+      labels:
+        severity: warning
+        component: peer-hub
+      annotations:
+        summary: "Peer review consensus time p95 > 180s"
+        description: "95th percentile consensus time is {{ $value }}s (SLO: 180s)"
+
+    # Escalation resolution time SLO
+    - alert: EscalationResolutionSLOViolation
+      expr: |
+        histogram_quantile(0.90,
+          rate(escalation_resolution_time_bucket[10m])
+        ) > 600
+      for: 10m
+      labels:
+        severity: warning
+        component: supervisor
+      annotations:
+        summary: "Escalation resolution time p90 > 600s"
+        description: "90th percentile resolution time is {{ $value }}s (SLO: 600s)"
+
+    # Task completion rate SLO
+    - alert: TaskCompletionRateSLOViolation
+      expr: |
+        (
+          rate(tasks_completed_total[10m])
+          /
+          rate(tasks_created_total[10m])
+        ) < 0.95
+      for: 10m
+      labels:
+        severity: critical
+        component: orchestrator
+      annotations:
+        summary: "Task completion rate < 95%"
+        description: "Only {{ $value | humanizePercentage }} of tasks completing (SLO: 95%)"
+
+    # Sandbox execution timeout rate
+    - alert: SandboxTimeoutRateHigh
+      expr: |
+        (
+          rate(sandbox_executions_timeout_total[5m])
+          /
+          rate(sandbox_executions_total[5m])
+        ) > 0.05
+      for: 5m
+      labels:
+        severity: warning
+        component: sandbox-executor
+      annotations:
+        summary: "Sandbox timeout rate > 5%"
+        description: "{{ $value | humanizePercentage }} of executions timing out"
+
+    # High error rate
+    - alert: HighErrorRate
+      expr: |
+        (
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+          /
+          sum(rate(http_requests_total[5m]))
+        ) > 0.01
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "HTTP error rate > 1%"
+        description: "{{ $value | humanizePercentage }} of requests failing"
