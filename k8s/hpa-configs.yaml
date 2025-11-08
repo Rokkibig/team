@@ -243,7 +243,7 @@ spec:
 # ServiceMonitor for Prometheus Custom Metrics
 # ============================================================================
 
-apiVersion: v1
+apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: peer-hub-metrics
@@ -260,7 +260,7 @@ spec:
     path: /metrics
 
 ---
-apiVersion: v1
+apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: supervisor-metrics
@@ -277,7 +277,7 @@ spec:
     path: /metrics
 
 ---
-apiVersion: v1
+apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: orchestrator-metrics
@@ -294,7 +294,7 @@ spec:
     path: /metrics
 
 ---
-apiVersion: v1
+apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
   name: sandbox-executor-metrics

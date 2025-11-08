@@ -4,12 +4,13 @@ Security middleware for API endpoints with JWT authentication
 """
 
 import os
+import json
 import logging
 from typing import Dict, List, Optional, Callable
 from datetime import datetime, timedelta
 from functools import wraps
 
-import jwt
+from jose import jwt
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from slowapi import Limiter
