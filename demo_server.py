@@ -61,11 +61,15 @@ async def lifespan(app: FastAPI):
     )
     print("✅ Redis connected")
 
-    # Initialize rate limiter
-    limiter = Limiter(key_func=get_remote_address)
+    # Initialize rate limiter with Redis storage
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    limiter = Limiter(
+        key_func=get_remote_address,
+        storage_uri=redis_url  # Use Redis for distributed rate limiting
+    )
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-    print("✅ Rate limiter initialized")
+    print("✅ Rate limiter initialized with Redis storage")
 
     yield
 

@@ -4,7 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Golden Architecture V5.1** is a production-grade, battle-hardened multi-agent orchestration system. The architecture implements five security layers, circuit breakers for fault tolerance, and SLO-based auto-scaling.
+**Golden Architecture V5.1** is a production-grade, battle-hardened multi-agent orchestration system with:
+- 5-layer security (LLM validation, RBAC + JWT, Sandbox isolation, Input sanitization, Data encryption)
+- Circuit breakers for fault tolerance and cascading failure prevention
+- Idempotent operations with exactly-once semantics
+- SLO-based auto-scaling (2-20 pods)
+- Unified error handling with standard `{error_code, message, details?, request_id}` format
+- Idempotent migration system with SHA256 checksum validation
+
+**Codebase**: ~10,500 lines across 32 files | **Database**: 11 tables | **API**: 8+ endpoints with `/api/v1` versioning
 
 ## Quick Start Commands
 
@@ -13,22 +21,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Create virtual environment
 python3 -m venv .venv
-source .venv/bin/activate  # or .venv/bin/activate on Windows
+source .venv/bin/activate
 
 # Install dependencies
-pip install -r requirements-minimal.txt
+pip install -r requirements-v5.1.txt
 
 # Setup environment variables
-cp .env.example .env  # Edit with your values
-# Required: JWT_SECRET, DATABASE_URL, REDIS_URL, NATS_URL
+cp .env.example .env  # Edit with your actual values
+# Required: DATABASE_URL, REDIS_URL, JWT_SECRET
+# Optional: NATS_URL, CORS_ALLOW_ORIGINS
 ```
 
 ### Database Operations
 
 ```bash
-# Run all migrations in order
-psql $DATABASE_URL -f migrations/001_initial_schema.sql
-psql $DATABASE_URL -f migrations/002_peer_review.sql
+# Run idempotent migrations (RECOMMENDED - tracks in schema_migrations table)
+python scripts/migrate.py
+
+# Check migration status
+psql -d golden_arch -c "SELECT version, applied_at, duration_ms FROM schema_migrations ORDER BY version;"
+
+# OR manually run migrations (not recommended - no tracking)
+psql $DATABASE_URL -f migrations/001_core_schema.sql
+psql $DATABASE_URL -f migrations/002_circuit_breaker.sql
 psql $DATABASE_URL -f migrations/003_learning_governance.sql
 
 # Check governance status
@@ -42,13 +57,31 @@ psql -d golden_arch -c "SELECT can_auto_update_prompt('developer');"
 
 ```bash
 # Start infrastructure (requires Docker)
-docker run -d --name nats -p 4222:4222 -p 8222:8222 nats:latest -js
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+docker run -d --name nats -p 4222:4222 nats:latest -js
 
 # Start demo API server
-.venv/bin/uvicorn demo_server:app --host 0.0.0.0 --port 8001
+uvicorn demo_server:app --host 0.0.0.0 --port 8000
 
 # Run API tests
-bash test_api.sh
+PORT=8000 bash test_api.sh
+```
+
+### API Testing
+
+```bash
+# Health check
+curl http://localhost:8000/health
+
+# Login (get JWT token)
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+
+# Use token for protected endpoints
+TOKEN="eyJ..."
+curl http://localhost:8000/api/v1/budget/state?tenant_id=org1&project_id=proj1 \
+  -H "Authorization: Bearer $TOKEN"
 ```
 
 ### Testing Individual Components
@@ -89,6 +122,20 @@ async def test():
 
 asyncio.run(test())
 EOF
+
+# Test unified error handling
+python3 << 'EOF'
+from common.error_handlers import ErrorResponse, create_error_response
+
+# Create standard error
+error = create_error_response(
+    error_code="budget.insufficient",
+    message="Not enough tokens",
+    details={"available": 1000, "requested": 5000},
+    request_id="550e8400-e29b-41d4-a716-446655440000"
+)
+print(f"✅ Error format: {error}")
+EOF
 ```
 
 ## Architecture Patterns
@@ -98,12 +145,35 @@ EOF
 The system implements defense-in-depth with 5 layers:
 
 1. **Network Layer**: TLS, WAF, DDoS protection
-2. **API Layer** (`api/security.py`): JWT auth, RBAC, rate limiting
-3. **Input Layer** (`supervisor_optimizer/llm_utils.py`): Schema validation, sanitization
-4. **Execution Layer** (`sandbox_executor/secure_executor.py`): gVisor isolation
+2. **API Layer** (`api/security.py`): JWT auth, RBAC (5 roles, 17 permissions), rate limiting
+3. **Input Layer** (`supervisor_optimizer/llm_utils.py`): JSON schema validation, SQL/script injection prevention
+4. **Execution Layer** (`sandbox_executor/secure_executor.py`): gVisor isolation, no-new-privileges, read-only FS
 5. **Data Layer**: Encryption at rest/transit, audit logs
 
 **Key Pattern**: Always validate LLM responses with `safe_parse_synthesis()` before processing.
+
+### Unified Error Handling
+
+All API errors follow standard format (`common/error_handlers.py`):
+
+```json
+{
+  "error_code": "budget.insufficient",
+  "message": "Human-readable message",
+  "details": {"available": 1000, "requested": 5000},
+  "request_id": "550e8400-..."
+}
+```
+
+**Error code hierarchy**:
+- `validation.*` (400/422) - Invalid input
+- `auth.*` (401/403) - Authentication/authorization
+- `resource.not_found` (404)
+- `state.conflict` (409) - Budget, idempotency conflicts
+- `rate_limit.exceeded` (429)
+- `internal.error` (500)
+
+**Key Pattern**: Use `install_error_handlers(app)` in FastAPI to auto-format all errors.
 
 ### Fault Tolerance Flow
 
@@ -118,6 +188,27 @@ Request → Circuit Breaker → Idempotency Check → Processing → DLQ (if fai
 - **DLQ** (`messaging/jetstream_setup.py`): Failed messages logged to database
 
 **Key Pattern**: Wrap risky operations with circuit breakers. Use `request_id` for idempotency.
+
+### Idempotent Migrations
+
+Migration system tracks applied migrations in `schema_migrations` table:
+
+```sql
+CREATE TABLE schema_migrations (
+    version TEXT PRIMARY KEY,        -- "001", "002", "003"
+    checksum TEXT NOT NULL,          -- SHA256 hash
+    applied_at TIMESTAMPTZ DEFAULT NOW(),
+    duration_ms INTEGER
+);
+```
+
+**Features**:
+- SHA256 checksum validation (detects modified files)
+- Transactional apply (atomic SQL + tracking)
+- Idempotent (safe to run multiple times)
+- Performance tracking (duration in ms)
+
+**Key Pattern**: Always use `python scripts/migrate.py` instead of manual psql.
 
 ### Learning Governance
 
@@ -150,9 +241,11 @@ Idempotent budget requests with exactly-once semantics:
 4. Cache result in Redis (5min TTL)
 5. Duplicate requests get cached response
 
-**Key Tables**:
-- `budget_limits`: Tenant/project limits and current usage
-- `budget_transactions`: Audit trail (reserve/commit/release)
+**API endpoints** (`/api/v1`):
+- `POST /budget/request` - Reserve tokens
+- `POST /budget/commit` - Confirm usage
+- `POST /budget/release` - Cancel reservation
+- `GET /budget/state` - Check balance
 
 **Key Pattern**: Always provide `request_id` for budget operations to ensure idempotency.
 
@@ -176,22 +269,26 @@ Each parser enforces strict JSON schemas and removes SQL/script/command injectio
 
 ### RBAC System (`api/security.py`)
 
-5 roles with different permissions and rate limits:
+5 roles with different permissions:
 
-| Role | Rate Limit | Key Permissions |
-|------|-----------|-----------------|
-| admin | 100/min | All permissions |
-| operator | 50/min | Escalations, tasks |
-| developer | 30/min | Task CRUD |
-| observer | 20/min | Read-only |
-| anonymous | 5/min | Minimal |
+| Role | Permissions | Description |
+|------|-------------|-------------|
+| admin | 17 permissions | Full system access, including DLQ resolve, breaker reset |
+| operator | 11 permissions | Escalations, tasks, budget view, DLQ read |
+| developer | 7 permissions | Task CRUD, budget view |
+| observer | 4 permissions | Read-only access |
+| anonymous | 1 permission | Health check only |
+
+**New permissions** (recently added):
+- `Permission.READ_DLQ` - View dead letter queue
+- `Permission.RESOLVE_DLQ` - Resolve DLQ messages (admin only)
 
 ```python
 # Protect endpoints with permissions
-@app.post("/escalations/{id}/resolve")
-@rbac.require_permission(Permission.ESCALATION_RESOLVE)
-async def resolve_escalation(user=Depends(rbac.verify_token)):
-    # User guaranteed to have permission
+@app.post("/api/v1/dlq/{id}/resolve")
+@rbac.require_permission(Permission.RESOLVE_DLQ)
+async def resolve_dlq(user=Depends(rbac.verify_token)):
+    # User guaranteed to have RESOLVE_DLQ permission
     ...
 ```
 
@@ -210,24 +307,68 @@ result = await breaker.call(risky_function, args)
 
 # Get all breaker stats
 stats = circuit_breaker_registry.get_all_stats()
+
+# Reset all breakers (admin only via API)
+# POST /api/v1/circuit-breakers/reset_all
 ```
 
 ## Database Schema Key Tables
 
-- **tasks**: Task state machine (id, state, metadata)
-- **agents**: Agent registry (id, role, status)
-- **agent_prompts**: Learning history with governance columns
-- **peer_review_sessions**: Consensus voting sessions
-- **peer_votes**: Individual agent votes with weights
-- **escalations**: Failed consensus requiring supervisor
-- **budget_limits**: Per-tenant/project token budgets
-- **budget_transactions**: Audit trail for budget operations
-- **dlq_messages**: Failed messages with retry count
-- **audit_log**: Security-relevant actions
+**Core tables**:
+- `tasks` - Task state machine (id, state, metadata)
+- `agents` - Agent registry (id, role, status)
+- `schema_migrations` - Migration tracking (version, checksum, applied_at)
 
-**Important**: `learning_governance` table controls auto-learning rates per role.
+**Budget system**:
+- `budget_limits` - Tenant/project limits and current usage
+- `budget_transactions` - Audit trail (reserve/commit/release)
+
+**Reliability**:
+- `dlq_messages` - Failed messages with retry count
+- `circuit_breaker_state` - Persisted breaker states
+
+**Governance**:
+- `learning_governance` - Per-role learning rate limits
+- `learning_history` - Prompt update audit trail
+- `governance_status` (VIEW) - Real-time governance status
+
+**Audit**:
+- `audit_log` - Security-relevant actions (who, what, when)
+
+## API Endpoints (`/api/v1`)
+
+**Auth**:
+- `POST /auth/login` - Get JWT token (demo users: admin/admin123, operator/operator123)
+
+**Budget**:
+- `POST /budget/request` - Reserve tokens
+- `POST /budget/commit` - Confirm usage
+- `POST /budget/release` - Cancel reservation
+- `GET /budget/state?tenant_id=X&project_id=Y` - Check balance
+
+**DLQ**:
+- `GET /dlq?resolved=false&limit=50` - List messages
+- `GET /dlq/{id}` - Message details
+- `POST /dlq/{id}/resolve` - Resolve (admin only)
+
+**Circuit Breakers**:
+- `GET /circuit-breakers` - All breaker states
+- `POST /circuit-breakers/reset_all` - Reset all (admin only)
+
+**System**:
+- `GET /health` - Health check
+- `GET /stats` - System statistics
+- `GET /governance/status` - Governance rules status
 
 ## When Modifying Code
+
+### Adding New API Endpoint
+
+1. Add to `api/new_endpoints.py` (or create new router)
+2. Include router in `demo_server.py` with `/api/v1` prefix
+3. Add permission check if protected: `@rbac.require_permission(Permission.XXX)`
+4. Use unified error format: raise `HTTPException` with appropriate status code
+5. Document in this file
 
 ### Adding New LLM Response Type
 
@@ -238,14 +379,21 @@ stats = circuit_breaker_registry.get_all_stats()
 ### Adding New RBAC Permission
 
 1. Add to `Permission` class in `api/security.py`
-2. Update `ROLE_PERMISSIONS` mapping
-3. Document in role table
+2. Update `ROLE_PERMISSIONS` mapping for relevant roles
+3. Document in role table above
 
 ### Adding New Agent Role
 
 1. Add governance rule: `INSERT INTO learning_governance (agent_role, ...) VALUES (...)`
 2. Update `ROLE_PERMISSIONS` in `api/security.py` if needed
 3. Test with `SELECT can_auto_update_prompt('new_role')`
+
+### Adding New Database Migration
+
+1. Create `migrations/00X_description.sql` (increment number)
+2. Include rollback comments for reference
+3. Run `python scripts/migrate.py` to apply
+4. Migration will be tracked in `schema_migrations` table
 
 ### Modifying Budget Logic
 
@@ -258,12 +406,12 @@ ALWAYS maintain idempotency:
 
 Entry points by use case:
 
-- **New developers**: Start with `LAUNCH_SUCCESS.md` (if system is running) or `README_V5.1.md`
-- **Quick setup**: `QUICK_START_V5.1.md` (30-minute guide)
-- **Architecture understanding**: `ARCHITECTURE_V5.1_DIAGRAM.md` (diagrams)
-- **Production deployment**: `DEPLOYMENT_CHECKLIST.md` (step-by-step)
-- **API reference**: `demo_server.py` (example endpoints)
-- **File navigation**: `INDEX_V5.1.md` (complete index)
+- **Overview**: `README_V5.1.md` - Project introduction
+- **Next steps**: `PRODUCTION_READINESS_ROADMAP.md` - High-priority improvements
+- **Complete summary**: `FINAL_SUMMARY.md` - Full project overview
+- **Code audit**: `AUDIT_FIXES_AND_FRONTEND_PLAN.md` - Fixes + frontend plan
+- **Architecture**: `ARCHITECTURE_V5.1_DIAGRAM.md` - System diagrams
+- **Environment**: `.env.example` - Required/optional variables
 
 ## Common Patterns to Follow
 
@@ -273,6 +421,17 @@ Entry points by use case:
 from supervisor_optimizer.llm_utils import safe_parse_synthesis
 
 result = safe_parse_synthesis(llm_response)  # Raises ValueError if invalid
+```
+
+### Error Handling
+```python
+# Use standard error format
+from fastapi import HTTPException
+
+raise HTTPException(
+    status_code=409,
+    detail="budget.insufficient"  # Will be formatted by error handlers
+)
 ```
 
 ### Fault Tolerance
@@ -295,6 +454,13 @@ decision = await budget.request_tokens(
 )
 ```
 
+### Database Connections
+```python
+# Use connection pool from app state
+async with app.state.db_pool.acquire() as conn:
+    rows = await conn.fetch("SELECT * FROM tasks")
+```
+
 ### Governance Checks
 ```sql
 -- Check before auto-learning
@@ -304,19 +470,67 @@ SELECT can_auto_update_prompt('agent_role');
 ## Infrastructure Dependencies
 
 - **PostgreSQL 14+**: Primary data store (11 tables)
-- **Redis 7+**: Cache + idempotency layer
-- **NATS with JetStream**: Message bus with DLQ
-- **Docker**: For NATS and optional gVisor sandbox
+- **Redis 7+**: Cache, idempotency, rate limiting storage
+- **NATS with JetStream**: Message bus with DLQ (optional)
+- **Docker**: For Redis, NATS, and optional gVisor sandbox
 
 ## Environment Variables (.env)
 
-Required variables:
-- `JWT_SECRET`: Strong random secret for JWT tokens
-- `DATABASE_URL`: PostgreSQL connection string
-- `REDIS_URL`: Redis connection string
-- `NATS_URL`: NATS server URL
+**Required**:
+- `DATABASE_URL` - PostgreSQL connection string
+- `REDIS_URL` - Redis connection string
+- `JWT_SECRET` - Strong random secret for JWT tokens (use `openssl rand -hex 32`)
 
-Optional:
-- `SANDBOX_RATE_LIMIT`: Rate limit for sandbox (default: 10/minute)
-- `DEFAULT_TENANT_LIMIT`: Default token budget (default: 1000000)
-- `HOST`, `PORT`: Server binding (default: 0.0.0.0:8000)
+**Optional**:
+- `NATS_URL` - NATS server URL (for DLQ)
+- `CORS_ALLOW_ORIGINS` - Comma-separated list of allowed origins
+- `HOST` - Server bind address (default: 0.0.0.0)
+- `PORT` - Server port (default: 8000)
+- `LOGIN_MAX_ATTEMPTS` - Login brute-force limit (default: 5)
+- `LOGIN_LOCKOUT_TTL_SECONDS` - Lockout duration (default: 900)
+
+## Production Readiness Status
+
+✅ **Complete**:
+- Unified error handling
+- Idempotent migrations
+- DB connection pool
+- Redis integration
+- API versioning (`/api/v1`)
+- CORS middleware
+- RBAC + JWT
+
+⏳ **Recommended additions** (see PRODUCTION_READINESS_ROADMAP.md):
+- Rate limiting (SlowAPI + Redis storage)
+- Password hashing (bcrypt + login lockout)
+- Prometheus metrics (`/metrics` endpoint)
+- CORS via ENV configuration
+- Structured JSON logging
+
+## Testing
+
+```bash
+# Run all API tests
+bash test_api.sh
+
+# Expected output:
+# ✅ 1. Health Check: PASS
+# ✅ 2. Root Endpoint: PASS
+# ✅ 3. Governance Status: PASS
+# ✅ 4. System Stats: PASS
+# ✅ 5. SQL Injection Test: PASS
+```
+
+## Git Workflow
+
+```bash
+# View commit history
+git log --oneline
+
+# Recent commits:
+# 951f58e 📊 Final Project Summary
+# 990b81e 📋 Production Readiness Roadmap
+# e363102 🗄️ Idempotent Migration System
+# 0e2dcfe ✨ Unified Error Handling
+# 0532fed 🔧 Redis, CORS, API Versioning
+```

@@ -41,18 +41,22 @@ class BudgetResponse(BaseModel):
     reason: Optional[str]
 
 class BudgetCommitModel(BaseModel):
+    tenant_id: str
+    project_id: str
     reservation_id: str
     actual_tokens: int
 
 class BudgetReleaseModel(BaseModel):
+    tenant_id: str
+    project_id: str
     reservation_id: str
 
 class DLQMessage(BaseModel):
     id: str
     original_subject: str
-    payload: dict
-    error: str
-    attempts: int
+    data_preview: str  # First 200 chars of data
+    error: Optional[str]  # From headers.error if exists
+    attempts: int  # Mapped from error_count
     created_at: datetime
     resolved: bool
 
@@ -76,6 +80,7 @@ DEMO_USERS = {
 async def login(request: LoginRequest):
     """
     Login endpoint - returns JWT token
+    Rate limited: 10 requests per minute per IP (via decorator)
 
     Demo credentials:
     - admin/admin123
@@ -86,7 +91,8 @@ async def login(request: LoginRequest):
     user = DEMO_USERS.get(request.username)
 
     if not user or user["password"] != request.password:
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+        # Use error_code marker for unified error handler
+        raise HTTPException(status_code=401, detail="auth.invalid_credentials: Invalid credentials")
 
     # Generate JWT token
     token = rbac.generate_token(
@@ -118,27 +124,49 @@ async def budget_request(
 ):
     """Request budget allocation for tokens"""
 
-    # Get Redis from app state
     redis = req.app.state.redis
+    db_pool = req.app.state.db_pool
 
-    # Simple budget check (in production: use IdempotentBudgetController)
+    # Namespaced keys for tenant/project isolation
     budget_key = f"budget:{request.tenant_id}:{request.project_id}"
+    reservations_set = f"reservations:{request.tenant_id}:{request.project_id}"
 
-    # Get current usage (default 100k tokens per project)
-    current_usage = await redis.get(budget_key) or "0"
-    total_limit = 100000
-    available = total_limit - int(current_usage)
+    async with db_pool.acquire() as conn:
+        # Get limit from DB (or use default 100k)
+        limit_row = await conn.fetchrow(
+            "SELECT total_limit FROM budget_limits WHERE tenant_id = $1 AND project_id = $2",
+            request.tenant_id, request.project_id
+        )
+        total_limit = limit_row["total_limit"] if limit_row else 100000
+
+    # Get current usage
+    used = int(await redis.get(budget_key) or "0")
+
+    # Count reserved tokens from Set
+    reservation_ids = await redis.smembers(reservations_set)
+    reserved = 0
+    for res_id in reservation_ids:
+        res_key = f"reservation:{request.tenant_id}:{request.project_id}:{res_id}"
+        res_data = await redis.get(res_key)
+        if res_data:
+            tokens, _ = res_data.split(":", 1)
+            reserved += int(tokens)
+
+    available = total_limit - used - reserved
 
     if available >= request.estimated_tokens:
-        # Approve and create reservation
+        # Approve and create namespaced reservation
         reservation_id = str(uuid.uuid4())
-        reservation_key = f"reservation:{reservation_id}"
+        reservation_key = f"reservation:{request.tenant_id}:{request.project_id}:{reservation_id}"
 
         await redis.setex(
             reservation_key,
             3600,  # 1 hour expiry
             f"{request.estimated_tokens}:{request.task_id}"
         )
+        # Add to reservations set
+        await redis.sadd(reservations_set, reservation_id)
+        await redis.expire(reservations_set, 3600)
 
         return BudgetResponse(
             approved=True,
@@ -146,10 +174,9 @@ async def budget_request(
             allocated=request.estimated_tokens
         )
     else:
-        return BudgetResponse(
-            approved=False,
-            allocated=0,
-            reason=f"Insufficient budget. Available: {available}, Requested: {request.estimated_tokens}"
+        raise HTTPException(
+            status_code=409,
+            detail=f"budget.insufficient: Available {available}, Requested {request.estimated_tokens}"
         )
 
 @router.post("/budget/commit")
@@ -159,18 +186,26 @@ async def budget_commit(
     req: Request,
     user = Depends(rbac.verify_token)
 ):
-    """Commit actual token usage"""
+    """Commit actual token usage and increment used counter"""
 
     redis = req.app.state.redis
-    reservation_key = f"reservation:{request.reservation_id}"
+
+    # Namespaced keys
+    reservation_key = f"reservation:{request.tenant_id}:{request.project_id}:{request.reservation_id}"
+    budget_key = f"budget:{request.tenant_id}:{request.project_id}"
+    reservations_set = f"reservations:{request.tenant_id}:{request.project_id}"
 
     # Get reservation
     reservation = await redis.get(reservation_key)
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found or expired")
 
-    # Delete reservation
+    # Increment used counter
+    await redis.incrby(budget_key, request.actual_tokens)
+
+    # Delete reservation and remove from set
     await redis.delete(reservation_key)
+    await redis.srem(reservations_set, request.reservation_id)
 
     return {"status": "committed", "tokens": request.actual_tokens}
 
@@ -181,12 +216,17 @@ async def budget_release(
     req: Request,
     user = Depends(rbac.verify_token)
 ):
-    """Release unused reservation"""
+    """Release unused reservation (cancel without incrementing used)"""
 
     redis = req.app.state.redis
-    reservation_key = f"reservation:{request.reservation_id}"
 
+    # Namespaced keys
+    reservation_key = f"reservation:{request.tenant_id}:{request.project_id}:{request.reservation_id}"
+    reservations_set = f"reservations:{request.tenant_id}:{request.project_id}"
+
+    # Delete reservation without incrementing used
     await redis.delete(reservation_key)
+    await redis.srem(reservations_set, request.reservation_id)
 
     return {"status": "released"}
 
@@ -198,26 +238,35 @@ async def budget_state(
     req: Request,
     user = Depends(rbac.verify_token)
 ):
-    """Get budget state for tenant/project"""
+    """Get budget state for tenant/project (no SCAN, uses namespaced Set)"""
 
     redis = req.app.state.redis
+    db_pool = req.app.state.db_pool
+
+    # Namespaced keys
     budget_key = f"budget:{tenant_id}:{project_id}"
+    reservations_set = f"reservations:{tenant_id}:{project_id}"
 
+    # Get limit from DB
+    async with db_pool.acquire() as conn:
+        limit_row = await conn.fetchrow(
+            "SELECT total_limit FROM budget_limits WHERE tenant_id = $1 AND project_id = $2",
+            tenant_id, project_id
+        )
+        total = limit_row["total_limit"] if limit_row else 100000
+
+    # Get used from Redis
     used = int(await redis.get(budget_key) or "0")
-    total = 100000  # Default limit
 
-    # Count active reservations
-    cursor = 0
+    # Count reservations from Set (no global SCAN)
+    reservation_ids = await redis.smembers(reservations_set)
     reserved = 0
-    while True:
-        cursor, keys = await redis.scan(cursor, match="reservation:*", count=100)
-        for key in keys:
-            value = await redis.get(key)
-            if value:
-                tokens, _ = value.split(":")
-                reserved += int(tokens)
-        if cursor == 0:
-            break
+    for res_id in reservation_ids:
+        res_key = f"reservation:{tenant_id}:{project_id}:{res_id}"
+        res_data = await redis.get(res_key)
+        if res_data:
+            tokens, _ = res_data.split(":", 1)
+            reserved += int(tokens)
 
     return {
         "total": total,
@@ -246,7 +295,7 @@ async def get_dlq_messages(
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT id, original_subject, payload, error, attempts,
+            SELECT id, original_subject, data, headers, error_count,
                    created_at, resolved
             FROM dlq_messages
             WHERE resolved = $1
@@ -258,12 +307,20 @@ async def get_dlq_messages(
 
     messages = []
     for row in rows:
+        # Extract error from headers.error if exists
+        error_msg = None
+        if row["headers"] and isinstance(row["headers"], dict):
+            error_msg = row["headers"].get("error", "Unknown error")
+
+        # Preview first 200 chars of data
+        data_preview = row["data"][:200] if row["data"] else ""
+
         messages.append(DLQMessage(
             id=str(row["id"]),
             original_subject=row["original_subject"],
-            payload=row["payload"],
-            error=row["error"],
-            attempts=row["attempts"],
+            data_preview=data_preview,
+            error=error_msg,
+            attempts=row["error_count"],
             created_at=row["created_at"],
             resolved=row["resolved"]
         ))
@@ -305,13 +362,13 @@ async def resolve_dlq_message(
     db_pool = req.app.state.db_pool
 
     async with db_pool.acquire() as conn:
-        # Mark as resolved
+        # Mark as resolved (correct column: resolution_notes, not resolution_note)
         await conn.execute(
             """
             UPDATE dlq_messages
             SET resolved = TRUE,
                 resolved_at = NOW(),
-                resolution_note = $2
+                resolution_notes = $2
             WHERE id = $1
             """,
             message_id,
@@ -335,13 +392,15 @@ async def reset_all_circuit_breakers(user = Depends(rbac.verify_token)):
 
     from common.circuit_breaker import circuit_breaker_registry
 
-    reset_count = 0
-    for name, breaker in circuit_breaker_registry.items():
-        breaker.reset()
-        reset_count += 1
+    # Use the correct async reset_all() method
+    await circuit_breaker_registry.reset_all()
+
+    # Get all breaker names from stats
+    all_stats = circuit_breaker_registry.get_all_stats()
+    breaker_names = list(all_stats.keys())
 
     return {
         "status": "success",
-        "reset_count": reset_count,
-        "breakers": list(circuit_breaker_registry.keys())
+        "reset_count": len(breaker_names),
+        "breakers": breaker_names
     }
