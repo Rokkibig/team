@@ -6,12 +6,13 @@ Simple FastAPI server to demonstrate core functionality
 import os
 import json
 import asyncpg
-import redis.asyncio as aioredis
+import redis.asyncio as redis
 from datetime import datetime
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -52,7 +53,7 @@ async def lifespan(app: FastAPI):
     print("✅ Database pool created")
 
     # Create Redis connection
-    app.state.redis = await aioredis.from_url(
+    app.state.redis = await redis.from_url(
         os.getenv("REDIS_URL", "redis://localhost:6379/0"),
         encoding="utf-8",
         decode_responses=True
@@ -79,6 +80,22 @@ app = FastAPI(
     description="Battle-Hardened Multi-Agent System",
     version="5.1.0",
     lifespan=lifespan
+)
+
+# ============================================================================
+# CORS Configuration
+# ============================================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",  # React dev server
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:8080",  # Alternative frontend
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ============================================================================
@@ -288,9 +305,9 @@ async def get_config(user=Depends(rbac.verify_token)):
 # INCLUDE NEW API ENDPOINTS
 # ============================================================================
 
-# Include new endpoints router
+# Include new endpoints router with /api/v1 prefix
 from api.new_endpoints import router as new_endpoints_router
-app.include_router(new_endpoints_router, tags=["New APIs"])
+app.include_router(new_endpoints_router, prefix="/api/v1", tags=["API v1"])
 
 if __name__ == "__main__":
     import uvicorn
