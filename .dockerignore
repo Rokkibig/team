@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Env files (secrets should not be in image)
+.env
+.env.*
+!.env.example
+
+# Tests
+.pytest_cache/
+htmlcov/
+.coverage
+*.log
+
+# Docs
+*.md
+!README.md
+docs/
+
+# CI/CD
+.github/
+
+# Temporary files
+tmp/
+*.tmp
+server.pid
+/tmp/
+
+# Docker
+Dockerfile*
+docker-compose*.yml

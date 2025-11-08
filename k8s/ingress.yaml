@@ -1,0 +1,70 @@
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: golden-api-ingress
+  namespace: golden-architecture
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Security headers
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+spec:
+  tls:
+  - hosts:
+    - api.example.com
+    secretName: golden-api-tls
+  rules:
+  - host: api.example.com
+    http:
+      paths:
+      # Main API (public)
+      - path: /api/v1
+        pathType: Prefix
+        backend:
+          service:
+            name: golden-api
+            port:
+              name: http
+      # Health check (public, but read-only)
+      - path: /health
+        pathType: Exact
+        backend:
+          service:
+            name: golden-api
+            port:
+              name: http
+      # Block /metrics from external access (use NetworkPolicy + internal ServiceMonitor)
+      # Do NOT expose /metrics publicly
+---
+# Internal-only Ingress for /metrics (if needed for Grafana)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: golden-api-metrics-internal
+  namespace: golden-architecture
+  annotations:
+    kubernetes.io/ingress.class: nginx-internal
+    nginx.ingress.kubernetes.io/whitelist-source-range: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+spec:
+  rules:
+  - host: api-internal.example.com
+    http:
+      paths:
+      - path: /metrics
+        pathType: Exact
+        backend:
+          service:
+            name: golden-api
+            port:
+              name: http

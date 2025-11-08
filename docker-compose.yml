@@ -1,0 +1,111 @@
+version: "3.9"
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: golden-postgres
+    environment:
+      POSTGRES_DB: golden_arch
+      POSTGRES_USER: golden_user
+      POSTGRES_PASSWORD: golden_secure_pass_change_in_prod
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U golden_user -d golden_arch"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - golden-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: golden-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - golden-network
+
+  # NATS JetStream
+  nats:
+    image: nats:2-alpine
+    container_name: golden-nats
+    command: ["-js", "-m", "8222"]
+    ports:
+      - "4222:4222"  # Client connections
+      - "8222:8222"  # Monitoring
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - golden-network
+
+  # Main API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: golden-api
+    command: uvicorn demo_server:app --host 0.0.0.0 --port 8000
+    environment:
+      DATABASE_URL: postgresql://golden_user:golden_secure_pass_change_in_prod@postgres:5432/golden_arch
+      REDIS_URL: redis://redis:6379/0
+      NATS_URL: nats://nats:4222
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
+      CORS_ALLOW_ORIGINS: ${CORS_ALLOW_ORIGINS:-http://localhost:3000,http://localhost:5173}
+      LOGIN_MAX_ATTEMPTS: ${LOGIN_MAX_ATTEMPTS:-5}
+      LOGIN_LOCKOUT_TTL_SECONDS: ${LOGIN_LOCKOUT_TTL_SECONDS:-900}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./migrations:/app/migrations:ro
+    networks:
+      - golden-network
+    restart: unless-stopped
+
+  # Sandbox Executor (Optional)
+  # sandbox:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile.sandbox
+  #   container_name: golden-sandbox
+  #   command: uvicorn sandbox_executor.secure_executor:app --host 0.0.0.0 --port 8001
+  #   environment:
+  #     SANDBOX_TIMEOUT: 30
+  #     SANDBOX_MEMORY_LIMIT: 256m
+  #   ports:
+  #     - "8001:8001"
+  #   networks:
+  #     - golden-network
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  golden-network:
+    driver: bridge

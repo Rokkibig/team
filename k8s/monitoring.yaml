@@ -1,0 +1,151 @@
+---
+# ServiceMonitor for Prometheus scraping
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: golden-api-metrics
+  namespace: golden-architecture
+  labels:
+    app: golden-api
+    prometheus: kube-prometheus
+spec:
+  selector:
+    matchLabels:
+      app: golden-api
+  endpoints:
+  - port: http
+    interval: 30s
+    path: /metrics
+    scheme: http
+---
+# PrometheusRule for Alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: golden-api-alerts
+  namespace: golden-architecture
+  labels:
+    role: alert-rules
+    prometheus: kube-prometheus
+spec:
+  groups:
+  - name: golden-api-slo
+    interval: 30s
+    rules:
+    - alert: HighHttpErrorRate
+      expr: |
+        (sum(rate(http_requests_total{namespace="golden-architecture",status=~"5.."}[5m])) /
+         sum(rate(http_requests_total{namespace="golden-architecture"}[5m]))) > 0.01
+      for: 5m
+      labels:
+        severity: critical
+        component: api
+      annotations:
+        summary: "High HTTP 5xx error rate"
+        description: "Error rate {{ $value | humanizePercentage }} exceeds 1% threshold"
+
+    - alert: ElevatedRateLimitExceeded
+      expr: |
+        sum(rate(http_requests_total{namespace="golden-architecture",status="429"}[5m])) > 1
+      for: 10m
+      labels:
+        severity: warning
+        component: api
+      annotations:
+        summary: "Frequent 429 rate limit responses"
+        description: "Rate limit exceeded > 1 req/s for 10 minutes"
+
+    - alert: SlowRequestsP95
+      expr: |
+        histogram_quantile(0.95, sum by (le, route, method) (
+          rate(http_request_duration_seconds_bucket{namespace="golden-architecture"}[5m])
+        )) > 1
+      for: 10m
+      labels:
+        severity: warning
+        component: api
+      annotations:
+        summary: "P95 request duration > 1s"
+        description: "95th percentile latency {{ $value }}s exceeds 1s"
+
+    - alert: HighAuthFailureRate
+      expr: |
+        (sum(rate(auth_logins_total{namespace="golden-architecture",result="fail"}[5m])) /
+         sum(rate(auth_logins_total{namespace="golden-architecture"}[5m]))) > 0.5
+      for: 10m
+      labels:
+        severity: warning
+        component: security
+      annotations:
+        summary: "High authentication failure rate"
+        description: "Auth failure rate {{ $value | humanizePercentage }} exceeds 50%"
+
+    - alert: BudgetInsufficientRate
+      expr: |
+        sum(rate(budget_requests_total{namespace="golden-architecture",status="insufficient"}[15m])) > 10
+      for: 15m
+      labels:
+        severity: info
+        component: budget
+      annotations:
+        summary: "High budget insufficient rate"
+        description: "{{ $value }} budget insufficient requests/s for 15 minutes"
+
+    - alert: ApiPodNotReady
+      expr: |
+        kube_pod_status_ready{namespace="golden-architecture",pod=~"golden-api-.*",condition="true"} == 0
+      for: 5m
+      labels:
+        severity: critical
+        component: infrastructure
+      annotations:
+        summary: "API pod not ready"
+        description: "Pod {{ $labels.pod }} not ready for 5 minutes"
+
+    - alert: ApiHighMemoryUsage
+      expr: |
+        container_memory_working_set_bytes{namespace="golden-architecture",pod=~"golden-api-.*"} /
+        container_spec_memory_limit_bytes{namespace="golden-architecture",pod=~"golden-api-.*"} > 0.85
+      for: 10m
+      labels:
+        severity: warning
+        component: resources
+      annotations:
+        summary: "High memory usage"
+        description: "Pod {{ $labels.pod }} using {{ $value | humanizePercentage }} of memory limit"
+---
+# NetworkPolicy to restrict /metrics access (internal only)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: golden-api-metrics-policy
+  namespace: golden-architecture
+spec:
+  podSelector:
+    matchLabels:
+      app: golden-api
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow Prometheus scraping
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 8000
+  # Allow traffic from ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8000
+  # Allow internal namespace traffic
+  - from:
+    - podSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
