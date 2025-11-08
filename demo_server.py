@@ -32,6 +32,7 @@ if missing:
 from api.security import rbac, Permission, AuditLogger
 from supervisor_optimizer.llm_utils import safe_parse_synthesis, sanitize_llm_response
 from common.circuit_breaker import CircuitBreaker, circuit_breaker_registry
+from common.error_handlers import install_error_handlers
 
 # ============================================================================
 # LIFESPAN - DB Pool & Redis Connection
@@ -97,6 +98,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ============================================================================
+# ERROR HANDLERS
+# ============================================================================
+
+install_error_handlers(app)
 
 # ============================================================================
 # MODELS
