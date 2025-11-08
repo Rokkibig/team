@@ -5,13 +5,14 @@ Simple FastAPI server to demonstrate core functionality
 
 import os
 import json
+import time
 import asyncpg
 import redis.asyncio as redis
 from datetime import datetime
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, Optional
@@ -88,20 +89,52 @@ app = FastAPI(
 )
 
 # ============================================================================
-# CORS Configuration
+# CORS Configuration via ENV
 # ============================================================================
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",  # React dev server
-        "http://localhost:5173",  # Vite dev server
-        "http://localhost:8080",  # Alternative frontend
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+origins_env = os.getenv("CORS_ALLOW_ORIGINS", "")
+allow_origins = [o.strip() for o in origins_env.split(",") if o.strip()]
+
+if allow_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    print(f"✅ CORS enabled for origins: {allow_origins}")
+else:
+    print("⚠️  CORS_ALLOW_ORIGINS not set - CORS disabled")
+
+# ============================================================================
+# PROMETHEUS METRICS MIDDLEWARE
+# ============================================================================
+
+from common.metrics import (
+    HTTP_REQUESTS,
+    HTTP_REQUEST_DURATION,
+    generate_latest,
+    CONTENT_TYPE_LATEST
 )
+
+@app.middleware("http")
+async def metrics_middleware(request: Request, call_next):
+    """Collect HTTP metrics for all requests"""
+    start = time.perf_counter()
+    status_code = 500
+
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        duration = time.perf_counter() - start
+        route = getattr(request.scope.get("route"), "path", request.url.path)
+        method = request.method
+
+        HTTP_REQUESTS.labels(route=route, method=method, status=str(status_code)).inc()
+        HTTP_REQUEST_DURATION.labels(route=route, method=method).observe(duration)
 
 # ============================================================================
 # ERROR HANDLERS
@@ -159,6 +192,14 @@ async def health():
             "nats": "healthy"
         }
     }
+
+@app.get("/metrics")
+async def metrics():
+    """
+    Prometheus metrics endpoint
+    Returns metrics in Prometheus exposition format
+    """
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.post("/validate/synthesis")
 async def validate_synthesis(request: SynthesisRequest):

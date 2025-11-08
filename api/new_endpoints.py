@@ -8,11 +8,30 @@ from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime, timedelta
 import uuid
+import bcrypt
+import os
 
-from api.security import rbac, Permission
+from api.security import rbac, Permission, AuditLogger
+from common.metrics import (
+    AUTH_LOGINS,
+    BUDGET_REQUESTS,
+    BUDGET_COMMITS,
+    BUDGET_RELEASES,
+    DLQ_RESOLVED,
+    BREAKER_RESETS
+)
+
+# Audit logger dependency
+def get_audit_logger(req: Request) -> AuditLogger:
+    """Factory for AuditLogger dependency"""
+    return AuditLogger(req.app.state.db_pool)
 
 # Create router
 router = APIRouter()
+
+# Login lockout settings
+LOGIN_MAX_ATTEMPTS = int(os.getenv("LOGIN_MAX_ATTEMPTS", "5"))
+LOGIN_LOCKOUT_TTL = int(os.getenv("LOGIN_LOCKOUT_TTL_SECONDS", "900"))
 
 # ==============================================================================
 # MODELS
@@ -68,19 +87,26 @@ class DLQResolveModel(BaseModel):
 # AUTH ENDPOINTS
 # ==============================================================================
 
-# Mock users for demo (in production: use real user database)
+# Demo users with bcrypt hashed passwords (in production: use real user database)
 DEMO_USERS = {
-    "admin": {"password": "admin123", "role": "admin"},
-    "operator": {"password": "operator123", "role": "operator"},
-    "developer": {"password": "dev123", "role": "developer"},
-    "observer": {"password": "obs123", "role": "observer"},
+    "admin": {"password_hash": "$2b$12$9VvRP7Egf4CQWu.cK2nDfeVwzUw/hze7CFAmBvR0qFoLe6XJ0DqYS", "role": "admin"},
+    "operator": {"password_hash": "$2b$12$rEo4hjoK0A8uf7ibBKaNmuAzEjJr.W4O0qKVQ4U3Fq1y3fyA9y4Oe", "role": "operator"},
+    "developer": {"password_hash": "$2b$12$ZL1VFIrPyket8NL7Yp7dlu/Ss8JIJCmSnKGgj/VnWsqad7paVF3TW", "role": "developer"},
+    "observer": {"password_hash": "$2b$12$g2n/iLfEenJctKL25GJYsOjcrq9Ilaa4/1ppVJgROlwf2WlcdA5iG", "role": "observer"},
 }
 
 @router.post("/auth/login", response_model=LoginResponse)
-async def login(request: LoginRequest):
+async def login(
+    request: LoginRequest,
+    req: Request,
+    audit: AuditLogger = Depends(get_audit_logger)
+):
     """
-    Login endpoint - returns JWT token
-    Rate limited: 10 requests per minute per IP (via decorator)
+    Login endpoint with bcrypt password hashing and Redis-based lockout
+
+    - Bcrypt password verification
+    - Lockout: 5 failed attempts → 429 for 15 minutes
+    - JWT token with 24h expiration
 
     Demo credentials:
     - admin/admin123
@@ -88,15 +114,70 @@ async def login(request: LoginRequest):
     - developer/dev123
     - observer/obs123
     """
-    user = DEMO_USERS.get(request.username)
+    redis = req.app.state.redis
 
-    if not user or user["password"] != request.password:
-        # Use error_code marker for unified error handler
-        raise HTTPException(status_code=401, detail="auth.invalid_credentials: Invalid credentials")
+    # Normalize username and create lockout key
+    username_lower = request.username.strip().lower()
+    client_ip = req.client.host if req.client else "unknown"
+    lock_key = f"login:attempts:{username_lower}:{client_ip}"
+
+    # Check/increment lockout counter
+    attempts = await redis.incr(lock_key)
+    if attempts == 1:
+        # First attempt - set TTL
+        await redis.expire(lock_key, LOGIN_LOCKOUT_TTL)
+
+    if attempts > LOGIN_MAX_ATTEMPTS:
+        # Lockout active
+        raise HTTPException(
+            status_code=429,
+            detail=f"rate_limit.exceeded: Too many login attempts. Try again in {LOGIN_LOCKOUT_TTL // 60} minutes"
+        )
+
+    # Get user and verify password
+    user = DEMO_USERS.get(username_lower)
+    if not user:
+        # User not found
+        AUTH_LOGINS.labels(result="fail").inc()
+        await audit.log_action(
+            user_id=username_lower,
+            role="anonymous",
+            action="auth.login.fail",
+            resource_type="auth",
+            resource_id=username_lower,
+            details={"reason": "user_not_found"}
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="auth.invalid_credentials: Invalid credentials"
+        )
+
+    # Verify bcrypt password
+    password_bytes = request.password.encode('utf-8')
+    hash_bytes = user["password_hash"].encode('utf-8')
+
+    if not bcrypt.checkpw(password_bytes, hash_bytes):
+        # Wrong password
+        AUTH_LOGINS.labels(result="fail").inc()
+        await audit.log_action(
+            user_id=username_lower,
+            role="anonymous",
+            action="auth.login.fail",
+            resource_type="auth",
+            resource_id=username_lower,
+            details={"reason": "invalid_password"}
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="auth.invalid_credentials: Invalid credentials"
+        )
+
+    # Success - reset lockout counter
+    await redis.delete(lock_key)
 
     # Generate JWT token
     token = rbac.generate_token(
-        user_id=request.username,
+        user_id=username_lower,
         role=user["role"],
         expires_in_hours=24
     )
@@ -104,6 +185,19 @@ async def login(request: LoginRequest):
     # Get permissions for role
     from api.security import ROLE_PERMISSIONS
     permissions = list(ROLE_PERMISSIONS.get(user["role"], []))
+
+    # Metrics: successful login
+    AUTH_LOGINS.labels(result="success").inc()
+
+    # Audit: successful login
+    await audit.log_action(
+        user_id=username_lower,
+        role=user["role"],
+        action="auth.login.success",
+        resource_type="auth",
+        resource_id=username_lower,
+        details=None
+    )
 
     return LoginResponse(
         token=token,
@@ -168,12 +262,18 @@ async def budget_request(
         await redis.sadd(reservations_set, reservation_id)
         await redis.expire(reservations_set, 3600)
 
+        # Metrics: budget approved
+        BUDGET_REQUESTS.labels(status="approved").inc()
+
         return BudgetResponse(
             approved=True,
             reservation_id=reservation_id,
             allocated=request.estimated_tokens
         )
     else:
+        # Metrics: budget insufficient
+        BUDGET_REQUESTS.labels(status="insufficient").inc()
+
         raise HTTPException(
             status_code=409,
             detail=f"budget.insufficient: Available {available}, Requested {request.estimated_tokens}"
@@ -184,7 +284,8 @@ async def budget_request(
 async def budget_commit(
     request: BudgetCommitModel,
     req: Request,
-    user = Depends(rbac.verify_token)
+    user = Depends(rbac.verify_token),
+    audit: AuditLogger = Depends(get_audit_logger)
 ):
     """Commit actual token usage and increment used counter"""
 
@@ -207,6 +308,19 @@ async def budget_commit(
     await redis.delete(reservation_key)
     await redis.srem(reservations_set, request.reservation_id)
 
+    # Metrics: budget commit
+    BUDGET_COMMITS.inc()
+
+    # Audit: budget commit
+    await audit.log_action(
+        user_id=user["user_id"],
+        role=user["role"],
+        action="budget.commit",
+        resource_type="budget",
+        resource_id=request.reservation_id,
+        details={"actual_tokens": request.actual_tokens, "tenant_id": request.tenant_id, "project_id": request.project_id}
+    )
+
     return {"status": "committed", "tokens": request.actual_tokens}
 
 @router.post("/budget/release")
@@ -214,7 +328,8 @@ async def budget_commit(
 async def budget_release(
     request: BudgetReleaseModel,
     req: Request,
-    user = Depends(rbac.verify_token)
+    user = Depends(rbac.verify_token),
+    audit: AuditLogger = Depends(get_audit_logger)
 ):
     """Release unused reservation (cancel without incrementing used)"""
 
@@ -227,6 +342,19 @@ async def budget_release(
     # Delete reservation without incrementing used
     await redis.delete(reservation_key)
     await redis.srem(reservations_set, request.reservation_id)
+
+    # Metrics: budget release
+    BUDGET_RELEASES.inc()
+
+    # Audit: budget release
+    await audit.log_action(
+        user_id=user["user_id"],
+        role=user["role"],
+        action="budget.release",
+        resource_type="budget",
+        resource_id=request.reservation_id,
+        details=None
+    )
 
     return {"status": "released"}
 
@@ -355,7 +483,8 @@ async def resolve_dlq_message(
     message_id: str,
     resolve_req: DLQResolveModel,
     req: Request,
-    user = Depends(rbac.verify_token)
+    user = Depends(rbac.verify_token),
+    audit: AuditLogger = Depends(get_audit_logger)
 ):
     """Resolve DLQ message"""
 
@@ -375,6 +504,19 @@ async def resolve_dlq_message(
             resolve_req.note
         )
 
+    # Metrics: DLQ resolved
+    DLQ_RESOLVED.inc()
+
+    # Audit: DLQ resolved
+    await audit.log_action(
+        user_id=user["user_id"],
+        role=user["role"],
+        action="dlq.resolve",
+        resource_type="dlq_message",
+        resource_id=message_id,
+        details={"note": resolve_req.note, "requeue": resolve_req.requeue}
+    )
+
     return {
         "status": "resolved",
         "message_id": message_id,
@@ -387,7 +529,10 @@ async def resolve_dlq_message(
 
 @router.post("/circuit-breakers/reset_all")
 @rbac.require_permission(Permission.SYSTEM_ADMIN)
-async def reset_all_circuit_breakers(user = Depends(rbac.verify_token)):
+async def reset_all_circuit_breakers(
+    user = Depends(rbac.verify_token),
+    audit: AuditLogger = Depends(get_audit_logger)
+):
     """Reset all circuit breakers (admin only)"""
 
     from common.circuit_breaker import circuit_breaker_registry
@@ -398,9 +543,23 @@ async def reset_all_circuit_breakers(user = Depends(rbac.verify_token)):
     # Get all breaker names from stats
     all_stats = circuit_breaker_registry.get_all_stats()
     breaker_names = list(all_stats.keys())
+    reset_count = len(breaker_names)
+
+    # Metrics: circuit breaker resets
+    BREAKER_RESETS.inc(reset_count)
+
+    # Audit: circuit breaker resets
+    await audit.log_action(
+        user_id=user["user_id"],
+        role=user["role"],
+        action="breakers.reset_all",
+        resource_type="circuit_breakers",
+        resource_id="all",
+        details={"reset_count": reset_count}
+    )
 
     return {
         "status": "success",
-        "reset_count": len(breaker_names),
+        "reset_count": reset_count,
         "breakers": breaker_names
     }
